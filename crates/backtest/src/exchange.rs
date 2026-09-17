@@ -888,7 +888,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_delta(&mut self, delta: OrderBookDelta) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::BookDelta(delta))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::BookDelta(delta))?;
+        }
 
         if !self.matching_engines.contains_key(&delta.instrument_id) {
             let instrument = {
@@ -920,7 +923,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
+        }
 
         if !self.matching_engines.contains_key(&deltas.instrument_id) {
             let instrument = {
@@ -952,7 +958,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_depth10(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::BookDepth10(Box::new(*depth)))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::BookDepth10(Box::new(*depth)))?;
+        }
 
         if !self.matching_engines.contains_key(&depth.instrument_id) {
             let instrument = {
@@ -984,7 +993,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_quote_tick(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::Quote(*quote))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::Quote(*quote))?;
+        }
 
         if !self.matching_engines.contains_key(&quote.instrument_id) {
             let instrument = {
@@ -1016,7 +1028,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_trade_tick(&mut self, trade: &TradeTick) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::Trade(*trade))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::Trade(*trade))?;
+        }
 
         if !self.matching_engines.contains_key(&trade.instrument_id) {
             let instrument = {
@@ -1048,7 +1063,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::Bar(bar))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::Bar(bar))?;
+        }
 
         if !self.matching_engines.contains_key(&bar.instrument_id()) {
             let instrument = {
@@ -1080,7 +1098,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_instrument_status(&mut self, status: InstrumentStatus) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::InstrumentStatus(status))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::InstrumentStatus(status))?;
+        }
 
         if !self.matching_engines.contains_key(&status.instrument_id) {
             let instrument = {
@@ -1112,7 +1133,10 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_instrument_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::InstrumentClose(close))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::InstrumentClose(close))?;
+        }
 
         if !self.matching_engines.contains_key(&close.instrument_id) {
             let instrument = {
@@ -1179,7 +1203,10 @@ impl SimulatedExchange {
         &mut self,
         funding_rate: FundingRateUpdate,
     ) -> anyhow::Result<Option<UnixNanos>> {
-        self.pre_process_modules(&Data::FundingRate(funding_rate))?;
+        // Skip building the owned `Data` when no simulation modules are registered.
+        if self.has_modules() {
+            self.pre_process_modules(&Data::FundingRate(funding_rate))?;
+        }
 
         let Some(boundary) = Self::funding_boundary(&funding_rate) else {
             log::debug!(
@@ -2341,5 +2368,81 @@ mod tests {
         exchange.reset().unwrap();
 
         assert!(exchange.inflight_counter.is_empty());
+    }
+
+    /// A simulation module that records each `pre_process` invocation.
+    #[derive(Debug)]
+    struct PreProcessRecorder {
+        calls: Rc<Cell<u32>>,
+    }
+
+    impl SimulationModule for PreProcessRecorder {
+        fn pre_process(&self, _data: &Data) -> anyhow::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(())
+        }
+
+        fn process(
+            &self,
+            _ts_now: UnixNanos,
+            _ctx: &ExchangeContext,
+        ) -> anyhow::Result<SimulationModuleResult> {
+            Ok(SimulationModuleResult::NotReady)
+        }
+
+        fn acknowledge(&self, _outcomes: &[AccountAdjustmentOutcome]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn log_diagnostics(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn reset(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[rstest]
+    fn test_module_pre_process_called_once_per_market_data_event(audusd_sim: CurrencyPair) {
+        let mut exchange = setup_exchange(Dispatch::Immediate);
+        exchange
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+            .unwrap();
+
+        // Register a module counting `pre_process` invocations.
+        let calls = Rc::new(Cell::new(0));
+        let module = Rc::new(PreProcessRecorder {
+            calls: calls.clone(),
+        });
+        exchange
+            .modules
+            .push(SimulationModuleHandle::from_rc(module));
+
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let deltas = OrderBookDeltas::new(
+            instrument_id,
+            vec![OrderBookDelta::clear(
+                instrument_id,
+                0,
+                UnixNanos::default(),
+                UnixNanos::from(1),
+            )],
+        );
+        let quote = QuoteTick {
+            instrument_id,
+            bid_price: Price::from("100.0000"),
+            ask_price: Price::from("101.0000"),
+            bid_size: Quantity::from("1.00000000"),
+            ask_size: Quantity::from("1.00000000"),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::from(1),
+        };
+
+        exchange.process_order_book_deltas(&deltas).unwrap();
+        exchange.process_quote_tick(&quote).unwrap();
+
+        // Each processed event must reach the module's `pre_process` exactly once.
+        assert_eq!(calls.get(), 2);
     }
 }
