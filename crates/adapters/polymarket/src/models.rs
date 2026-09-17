@@ -16,7 +16,7 @@
 //! Polymarket simulation models.
 
 use anyhow::Context;
-use nautilus_execution::models::fee::FeeModel;
+use nautilus_execution::models::fee::{FeeFillContext, FeeModel};
 #[cfg(feature = "python")]
 use nautilus_execution::python::fee::PyFeeModel;
 use nautilus_model::{
@@ -49,10 +49,10 @@ use crate::http::models::FeeSchedule;
 )]
 pub struct PolymarketFeeModel;
 
-impl FeeModel for PolymarketFeeModel {
-    fn get_commission(
+impl PolymarketFeeModel {
+    fn commission_for(
         &self,
-        order: &OrderAny,
+        liquidity_side: Option<LiquiditySide>,
         fill_quantity: Quantity,
         fill_px: Price,
         instrument: &InstrumentAny,
@@ -61,7 +61,7 @@ impl FeeModel for PolymarketFeeModel {
             anyhow::bail!("PolymarketFeeModel requires a binary option instrument");
         };
 
-        let liquidity_side = match order.liquidity_side() {
+        let liquidity_side = match liquidity_side {
             Some(LiquiditySide::Maker) => LiquiditySide::Maker,
             Some(LiquiditySide::Taker) => LiquiditySide::Taker,
             Some(LiquiditySide::NoLiquiditySide) | None => {
@@ -103,6 +103,34 @@ impl FeeModel for PolymarketFeeModel {
         };
 
         Money::from_decimal(commission, instrument.quote_currency()).map_err(Into::into)
+    }
+}
+
+impl FeeModel for PolymarketFeeModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(order.liquidity_side(), fill_quantity, fill_px, instrument)
+    }
+
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(
+            Some(fill.liquidity_side),
+            fill_quantity,
+            fill_px,
+            instrument,
+        )
     }
 }
 

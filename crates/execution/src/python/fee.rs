@@ -20,7 +20,7 @@ use nautilus_core::python::{
 };
 use nautilus_model::{
     instruments::InstrumentAny,
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     python::{
         instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
         orders::{order_any_to_pyobject, pyobject_to_order_any},
@@ -35,8 +35,9 @@ use pyo3::{
 use rust_decimal::Decimal;
 
 use crate::models::fee::{
-    CappedOptionFeeModel, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel, MakerTakerFeeModel,
-    PerContractFeeModel, ProbabilityPriceFeeModel, TieredNotionalOptionFeeModel,
+    CappedOptionFeeModel, FeeFillContext, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel,
+    MakerTakerFeeModel, PerContractFeeModel, ProbabilityPriceFeeModel,
+    TieredNotionalOptionFeeModel, write_filled_qty,
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")]
@@ -170,6 +171,42 @@ impl PythonFeeModel {
     pub fn new(obj: Py<PyAny>) -> Self {
         Self { obj }
     }
+
+    fn get_commission_for_order(
+        &self,
+        order: OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+        underlying_px: Option<Price>,
+        use_context_override: bool,
+    ) -> anyhow::Result<Money> {
+        Python::attach(|py| -> anyhow::Result<Money> {
+            let obj = self.obj.bind(py);
+            if !use_context_override
+                || !has_method_override_before_base(py, obj, "get_commission_with_context")?
+            {
+                let order = order_any_to_pyobject(py, order)?;
+                let instrument = instrument_any_to_pyobject(py, instrument.clone())?;
+                return obj
+                    .call_method1(
+                        "get_commission",
+                        (order, fill_quantity, fill_px, instrument),
+                    )?
+                    .extract()
+                    .map_err(|e| anyhow::anyhow!("{e}"));
+            }
+
+            let order = order_any_to_pyobject(py, order)?;
+            let instrument = instrument_any_to_pyobject(py, instrument.clone())?;
+            obj.call_method1(
+                "get_commission_with_context",
+                (order, fill_quantity, fill_px, instrument, underlying_px),
+            )?
+            .extract()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+    }
 }
 
 impl FeeModel for PythonFeeModel {
@@ -180,18 +217,14 @@ impl FeeModel for PythonFeeModel {
         fill_px: Price,
         instrument: &InstrumentAny,
     ) -> anyhow::Result<Money> {
-        Python::attach(|py| -> anyhow::Result<Money> {
-            let order = order_any_to_pyobject(py, order.clone())?;
-            let instrument = instrument_any_to_pyobject(py, instrument.clone())?;
-            self.obj
-                .bind(py)
-                .call_method1(
-                    "get_commission",
-                    (order, fill_quantity, fill_px, instrument),
-                )?
-                .extract()
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        })
+        self.get_commission_for_order(
+            order.clone(),
+            fill_quantity,
+            fill_px,
+            instrument,
+            None,
+            false,
+        )
         .map_err(|e| anyhow::anyhow!("Python FeeModel.get_commission failed: {e}"))
     }
 
@@ -203,30 +236,38 @@ impl FeeModel for PythonFeeModel {
         instrument: &InstrumentAny,
         underlying_px: Option<Price>,
     ) -> anyhow::Result<Money> {
-        Python::attach(|py| -> anyhow::Result<Money> {
-            let obj = self.obj.bind(py);
-            if !has_method_override_before_base(py, obj, "get_commission_with_context")? {
-                let order = order_any_to_pyobject(py, order.clone())?;
-                let instrument = instrument_any_to_pyobject(py, instrument.clone())?;
-                return obj
-                    .call_method1(
-                        "get_commission",
-                        (order, fill_quantity, fill_px, instrument),
-                    )?
-                    .extract()
-                    .map_err(|e| anyhow::anyhow!("{e}"));
-            }
-
-            let order = order_any_to_pyobject(py, order.clone())?;
-            let instrument = instrument_any_to_pyobject(py, instrument.clone())?;
-            obj.call_method1(
-                "get_commission_with_context",
-                (order, fill_quantity, fill_px, instrument, underlying_px),
-            )?
-            .extract()
-            .map_err(|e| anyhow::anyhow!("{e}"))
-        })
+        self.get_commission_for_order(
+            order.clone(),
+            fill_quantity,
+            fill_px,
+            instrument,
+            underlying_px,
+            true,
+        )
         .map_err(|e| anyhow::anyhow!("Python FeeModel.get_commission_with_context failed: {e}"))
+    }
+
+    fn get_fill_commission(
+        &self,
+        order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        // Build only the Python-facing snapshot required by the subclass API.
+        let mut snapshot = order.clone();
+        write_filled_qty(&mut snapshot, fill.filled_qty);
+        snapshot.set_liquidity_side(fill.liquidity_side);
+        self.get_commission_for_order(
+            snapshot,
+            fill_quantity,
+            fill_px,
+            instrument,
+            fill.underlying_px,
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("Python FeeModel.get_fill_commission failed: {e}"))
     }
 }
 
@@ -583,9 +624,10 @@ pub fn fee_model_any_to_pyobject(py: Python<'_>, model: &FeeModelAny) -> PyResul
 #[cfg(test)]
 mod tests {
     use nautilus_model::{
-        enums::{OrderSide, OrderType},
+        enums::{LiquiditySide, OrderSide, OrderType},
         instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
-        orders::{OrderAny, builder::OrderTestBuilder},
+        orders::{OrderAny, builder::OrderTestBuilder, stubs::TestOrderStubs},
+        types::Currency,
     };
     use pyo3::{IntoPyObjectExt, ffi::c_str, types::PyDict};
     use rstest::rstest;
@@ -617,6 +659,133 @@ mod tests {
                 .unwrap();
 
             assert_eq!(commission, expected_commission);
+        });
+    }
+
+    #[rstest]
+    fn test_python_fee_model_fill_commission_uses_context() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals
+                .set_item("Currency", py.get_type::<Currency>())
+                .unwrap();
+            locals.set_item("USD", Currency::USD()).unwrap();
+            locals
+                .set_item("FeeModel", py.get_type::<PyFeeModel>())
+                .unwrap();
+            locals
+                .set_item("LiquiditySide", py.get_type::<LiquiditySide>())
+                .unwrap();
+            locals.set_item("Money", py.get_type::<Money>()).unwrap();
+            let model = py
+                .eval(
+                    c_str!(
+                        "type('CustomFeeModel', (FeeModel,), {\
+                            'get_commission': \
+                                lambda self, order, fill_quantity, fill_px, instrument: \
+                                    Money(order.filled_qty.as_double() + \
+                                        (1 if order.liquidity_side == LiquiditySide.MAKER else 0), \
+                                        USD)\
+                        })()"
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+
+            let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+            let base_order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from(100_000))
+                .build();
+            let order =
+                TestOrderStubs::make_filled_order(&base_order, &instrument, LiquiditySide::Taker);
+            let handle = pyobject_to_fee_model_handle(&model).unwrap();
+            let commission = handle
+                .get_fill_commission(
+                    &order,
+                    FeeFillContext {
+                        filled_qty: Quantity::from("7"),
+                        liquidity_side: LiquiditySide::Maker,
+                        underlying_px: None,
+                    },
+                    Quantity::from("1"),
+                    Price::from("1"),
+                    &instrument,
+                )
+                .unwrap();
+
+            assert_eq!(commission, Money::from("8 USD"));
+        });
+    }
+
+    #[rstest]
+    fn test_python_fee_model_commission_methods_preserve_dispatch() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals
+                .set_item("FeeModel", py.get_type::<PyFeeModel>())
+                .unwrap();
+            locals.set_item("Money", py.get_type::<Money>()).unwrap();
+            locals.set_item("USD", Currency::USD()).unwrap();
+            let model = py
+                .eval(
+                    c_str!(
+                        "type('CustomFeeModel', (FeeModel,), {\
+                            'get_commission': \
+                                lambda self, order, fill_quantity, fill_px, instrument: \
+                                    Money(1, USD),\
+                            'get_commission_with_context': \
+                                lambda self, order, fill_quantity, fill_px, instrument, underlying_px: \
+                                    Money(2, USD)\
+                        })()"
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+
+            let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from(100_000))
+                .build();
+            let handle = pyobject_to_fee_model_handle(&model).unwrap();
+            let commission = handle
+                .get_commission(&order, Quantity::from(1), Price::from("1"), &instrument)
+                .unwrap();
+            let commission_with_context = handle
+                .get_commission_with_context(
+                    &order,
+                    Quantity::from(1),
+                    Price::from("1"),
+                    &instrument,
+                    None,
+                )
+                .unwrap();
+            let fill_commission = handle
+                .get_fill_commission(
+                    &order,
+                    FeeFillContext {
+                        filled_qty: Quantity::from("7"),
+                        liquidity_side: LiquiditySide::Maker,
+                        underlying_px: None,
+                    },
+                    Quantity::from(1),
+                    Price::from("1"),
+                    &instrument,
+                )
+                .unwrap();
+
+            assert_eq!(commission, Money::from("1 USD"));
+            assert_eq!(commission_with_context, Money::from("2 USD"));
+            assert_eq!(fill_commission, Money::from("2 USD"));
         });
     }
 

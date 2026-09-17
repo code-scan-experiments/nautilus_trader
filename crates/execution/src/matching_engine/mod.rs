@@ -81,7 +81,7 @@ use self::{
 use crate::{
     matching_core::{MatchAction, OrderMatchingCore, RestingOrder},
     models::{
-        fee::{FeeModel, FeeModelHandle},
+        fee::{FeeFillContext, FeeModel, FeeModelHandle, write_filled_qty},
         fill::{FillModel, FillModelHandle},
     },
     protection::protection_price_calculate,
@@ -5322,26 +5322,17 @@ impl OrderMatchingEngine {
             return Ok(());
         }
 
-        let fee_order;
-        let commission_order = {
-            // `order` is a stale pre-fill clone: give fee models the current
-            // pre-fill `filled_qty` (e.g. `FixedFeeModel` charges once per order).
-            let mut cloned = order.clone();
-            write_filled_qty(&mut cloned, new_filled_qty.saturating_sub(last_qty));
-            if order.liquidity_side() != Some(liquidity_side) {
-                cloned.set_liquidity_side(liquidity_side);
-            }
-            fee_order = cloned;
-            &fee_order
-        };
-
         let underlying_px = self.fee_underlying_price()?;
-        let commission = self.fee_model.get_commission_with_context(
-            commission_order,
+        let commission = self.fee_model.get_fill_commission(
+            order,
+            FeeFillContext {
+                filled_qty: new_filled_qty.saturating_sub(last_qty),
+                liquidity_side,
+                underlying_px,
+            },
             last_qty,
             last_px,
             &self.instrument,
-            underlying_px,
         )?;
 
         // Resolve implicit membership before dispatch can close the cached position
@@ -6941,24 +6932,6 @@ where
         PostMatchOrderAction::UpdateTrailing(clone_order(order))
     } else {
         PostMatchOrderAction::NoMaintenance
-    }
-}
-
-/// Writes `filled_qty` directly onto an order clone's core state.
-///
-/// Used to present fee models with the current pre-fill quantity when the
-/// order passed to the fill path is a stale clone (see `fill_order`).
-fn write_filled_qty(order: &mut OrderAny, filled_qty: Quantity) {
-    match order {
-        OrderAny::Limit(o) => o.filled_qty = filled_qty,
-        OrderAny::LimitIfTouched(o) => o.filled_qty = filled_qty,
-        OrderAny::Market(o) => o.filled_qty = filled_qty,
-        OrderAny::MarketIfTouched(o) => o.filled_qty = filled_qty,
-        OrderAny::MarketToLimit(o) => o.filled_qty = filled_qty,
-        OrderAny::StopLimit(o) => o.filled_qty = filled_qty,
-        OrderAny::StopMarket(o) => o.filled_qty = filled_qty,
-        OrderAny::TrailingStopLimit(o) => o.filled_qty = filled_qty,
-        OrderAny::TrailingStopMarket(o) => o.filled_qty = filled_qty,
     }
 }
 
