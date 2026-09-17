@@ -57,6 +57,61 @@ pub trait FeeModel {
     ) -> anyhow::Result<Money> {
         self.get_commission(order, fill_quantity, fill_px, instrument)
     }
+
+    /// Calculates commission from the pre-fill order state and fill context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if commission calculation fails.
+    fn get_fill_commission(
+        &self,
+        order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        // Materialize a snapshot for models that only implement the order-based API.
+        let mut snapshot = order.clone();
+        write_filled_qty(&mut snapshot, fill.filled_qty);
+        if snapshot.liquidity_side() != Some(fill.liquidity_side) {
+            snapshot.set_liquidity_side(fill.liquidity_side);
+        }
+        self.get_commission_with_context(
+            &snapshot,
+            fill_quantity,
+            fill_px,
+            instrument,
+            fill.underlying_px,
+        )
+    }
+}
+
+/// Pre-fill order state a fee model needs for a single fill, passed alongside
+/// the (possibly stale) order instead of a mutated full-order clone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeeFillContext {
+    /// Order filled quantity *before* this fill is applied.
+    pub filled_qty: Quantity,
+    /// Liquidity side of this fill.
+    pub liquidity_side: LiquiditySide,
+    /// Underlying price for option fee models (same meaning as `underlying_px` in `get_commission_with_context`).
+    pub underlying_px: Option<Price>,
+}
+
+/// Writes a filled quantity directly onto an order's core state.
+pub(crate) fn write_filled_qty(order: &mut OrderAny, filled_qty: Quantity) {
+    match order {
+        OrderAny::Limit(o) => o.filled_qty = filled_qty,
+        OrderAny::LimitIfTouched(o) => o.filled_qty = filled_qty,
+        OrderAny::Market(o) => o.filled_qty = filled_qty,
+        OrderAny::MarketIfTouched(o) => o.filled_qty = filled_qty,
+        OrderAny::MarketToLimit(o) => o.filled_qty = filled_qty,
+        OrderAny::StopLimit(o) => o.filled_qty = filled_qty,
+        OrderAny::StopMarket(o) => o.filled_qty = filled_qty,
+        OrderAny::TrailingStopLimit(o) => o.filled_qty = filled_qty,
+        OrderAny::TrailingStopMarket(o) => o.filled_qty = filled_qty,
+    }
 }
 
 /// Shared runtime handle for a fee model.
@@ -110,6 +165,18 @@ impl FeeModel for FeeModelHandle {
     ) -> anyhow::Result<Money> {
         self.0
             .get_commission_with_context(order, fill_quantity, fill_px, instrument, underlying_px)
+    }
+
+    fn get_fill_commission(
+        &self,
+        order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.0
+            .get_fill_commission(order, fill, fill_quantity, fill_px, instrument)
     }
 }
 
@@ -178,6 +245,27 @@ impl FeeModel for FeeModelAny {
             Self::Python(model) => model.get_commission_with_context(order, fill_quantity, fill_px, instrument, underlying_px),
         }
     }
+
+    #[rustfmt::skip]
+    fn get_fill_commission(
+        &self,
+        order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        match self {
+            Self::Fixed(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+            Self::MakerTaker(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+            Self::PerContract(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+            Self::ProbabilityPrice(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+            Self::CappedOption(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+            Self::TieredNotionalOption(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+            #[cfg(feature = "python")]
+            Self::Python(model) => model.get_fill_commission(order, fill, fill_quantity, fill_px, instrument),
+        }
+    }
 }
 
 impl Default for FeeModelAny {
@@ -222,6 +310,14 @@ impl FixedFeeModel {
             charge_commission_once: charge_commission_once.unwrap_or(true),
         })
     }
+
+    fn commission_for(&self, filled_qty: Quantity) -> Money {
+        if !self.charge_commission_once || filled_qty.is_zero() {
+            self.commission
+        } else {
+            self.zero_commission
+        }
+    }
 }
 
 impl FeeModel for FixedFeeModel {
@@ -232,11 +328,18 @@ impl FeeModel for FixedFeeModel {
         _fill_px: Price,
         _instrument: &InstrumentAny,
     ) -> anyhow::Result<Money> {
-        if !self.charge_commission_once || order.filled_qty().is_zero() {
-            Ok(self.commission)
-        } else {
-            Ok(self.zero_commission)
-        }
+        Ok(self.commission_for(order.filled_qty()))
+    }
+
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        fill: FeeFillContext,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        Ok(self.commission_for(fill.filled_qty))
     }
 }
 
@@ -269,6 +372,17 @@ impl PerContractFeeModel {
         }
         Ok(Self { commission })
     }
+
+    fn commission_for(
+        &self,
+        fill_quantity: Quantity,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        let contracts = spread_contract_count(instrument)?;
+        let total = mul_checked(self.commission.as_decimal(), fill_quantity.as_decimal())
+            .and_then(|v| mul_checked(v, contracts))?;
+        Money::from_decimal(total, self.commission.currency).map_err(Into::into)
+    }
 }
 
 fn mul_checked(lhs: Decimal, rhs: Decimal) -> anyhow::Result<Decimal> {
@@ -284,10 +398,18 @@ impl FeeModel for PerContractFeeModel {
         _fill_px: Price,
         instrument: &InstrumentAny,
     ) -> anyhow::Result<Money> {
-        let contracts = spread_contract_count(instrument)?;
-        let total = mul_checked(self.commission.as_decimal(), fill_quantity.as_decimal())
-            .and_then(|v| mul_checked(v, contracts))?;
-        Money::from_decimal(total, self.commission.currency).map_err(Into::into)
+        self.commission_for(fill_quantity, instrument)
+    }
+
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        _fill: FeeFillContext,
+        fill_quantity: Quantity,
+        _fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(fill_quantity, instrument)
     }
 }
 
@@ -345,6 +467,27 @@ fn spread_leg_ratio_parts(ratio: &str, symbol: &str) -> Option<i64> {
 )]
 pub struct MakerTakerFeeModel;
 
+impl MakerTakerFeeModel {
+    fn commission_for(
+        &self,
+        liquidity_side: Option<LiquiditySide>,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        let notional =
+            instrument.try_calculate_notional_value(fill_quantity, fill_px, Some(false))?;
+        let rate = match liquidity_side {
+            Some(LiquiditySide::Maker) => instrument.maker_fee(),
+            Some(LiquiditySide::Taker) => instrument.taker_fee(),
+            Some(LiquiditySide::NoLiquiditySide) | None => anyhow::bail!("Liquidity side not set"),
+        };
+        let commission = mul_checked(notional.as_decimal(), rate)?;
+
+        Money::from_decimal(commission, notional.currency).map_err(Into::into)
+    }
+}
+
 impl FeeModel for MakerTakerFeeModel {
     fn get_commission(
         &self,
@@ -353,16 +496,23 @@ impl FeeModel for MakerTakerFeeModel {
         fill_px: Price,
         instrument: &InstrumentAny,
     ) -> anyhow::Result<Money> {
-        let notional =
-            instrument.try_calculate_notional_value(fill_quantity, fill_px, Some(false))?;
-        let rate = match order.liquidity_side() {
-            Some(LiquiditySide::Maker) => instrument.maker_fee(),
-            Some(LiquiditySide::Taker) => instrument.taker_fee(),
-            Some(LiquiditySide::NoLiquiditySide) | None => anyhow::bail!("Liquidity side not set"),
-        };
-        let commission = mul_checked(notional.as_decimal(), rate)?;
+        self.commission_for(order.liquidity_side(), fill_quantity, fill_px, instrument)
+    }
 
-        Money::from_decimal(commission, notional.currency).map_err(Into::into)
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(
+            Some(fill.liquidity_side),
+            fill_quantity,
+            fill_px,
+            instrument,
+        )
     }
 }
 
@@ -391,10 +541,10 @@ impl FeeModel for MakerTakerFeeModel {
 )]
 pub struct ProbabilityPriceFeeModel;
 
-impl FeeModel for ProbabilityPriceFeeModel {
-    fn get_commission(
+impl ProbabilityPriceFeeModel {
+    fn commission_for(
         &self,
-        order: &OrderAny,
+        liquidity_side: Option<LiquiditySide>,
         fill_quantity: Quantity,
         fill_px: Price,
         instrument: &InstrumentAny,
@@ -408,7 +558,7 @@ impl FeeModel for ProbabilityPriceFeeModel {
             anyhow::bail!("ProbabilityPriceFeeModel requires a fill price in [0, 1]");
         }
 
-        let fee_rate = match order.liquidity_side() {
+        let fee_rate = match liquidity_side {
             Some(LiquiditySide::Maker) => instrument.maker_fee(),
             Some(LiquiditySide::Taker) => instrument.taker_fee(),
             Some(LiquiditySide::NoLiquiditySide) | None => anyhow::bail!("Liquidity side not set"),
@@ -421,6 +571,34 @@ impl FeeModel for ProbabilityPriceFeeModel {
             .map(|v| v.round_dp(5))?;
 
         Money::from_decimal(commission, instrument.quote_currency()).map_err(Into::into)
+    }
+}
+
+impl FeeModel for ProbabilityPriceFeeModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(order.liquidity_side(), fill_quantity, fill_px, instrument)
+    }
+
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(
+            Some(fill.liquidity_side),
+            fill_quantity,
+            fill_px,
+            instrument,
+        )
     }
 }
 
@@ -484,6 +662,32 @@ impl Default for CappedOptionFeeModel {
     }
 }
 
+impl CappedOptionFeeModel {
+    fn commission_for(
+        &self,
+        liquidity_side: Option<LiquiditySide>,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+        underlying_px: Option<Price>,
+    ) -> anyhow::Result<Money> {
+        check_option_instrument(instrument, "CappedOptionFeeModel")?;
+        let rate = option_fee_rate(liquidity_side, instrument, self.maker_rate, self.taker_rate)?;
+        let multiplier = instrument.multiplier().as_decimal();
+        let rate_fee = if instrument.is_inverse() {
+            rate
+        } else {
+            let underlying_px =
+                underlying_px.ok_or_else(|| anyhow::anyhow!("Underlying price is required"))?;
+            mul_checked(rate, underlying_px.as_decimal())?
+        };
+        let cap_fee = mul_checked(self.cap, fill_px.as_decimal())?;
+        let fee_per_contract = mul_checked(rate_fee.min(cap_fee), multiplier)?;
+        let total = mul_checked(fee_per_contract, fill_quantity.as_decimal())?;
+        Money::from_decimal(total, commission_currency(instrument)).map_err(Into::into)
+    }
+}
+
 impl FeeModel for CappedOptionFeeModel {
     fn get_commission(
         &self,
@@ -503,20 +707,30 @@ impl FeeModel for CappedOptionFeeModel {
         instrument: &InstrumentAny,
         underlying_px: Option<Price>,
     ) -> anyhow::Result<Money> {
-        check_option_instrument(instrument, "CappedOptionFeeModel")?;
-        let rate = option_fee_rate(order, instrument, self.maker_rate, self.taker_rate)?;
-        let multiplier = instrument.multiplier().as_decimal();
-        let rate_fee = if instrument.is_inverse() {
-            rate
-        } else {
-            let underlying_px =
-                underlying_px.ok_or_else(|| anyhow::anyhow!("Underlying price is required"))?;
-            mul_checked(rate, underlying_px.as_decimal())?
-        };
-        let cap_fee = mul_checked(self.cap, fill_px.as_decimal())?;
-        let fee_per_contract = mul_checked(rate_fee.min(cap_fee), multiplier)?;
-        let total = mul_checked(fee_per_contract, fill_quantity.as_decimal())?;
-        Money::from_decimal(total, commission_currency(instrument)).map_err(Into::into)
+        self.commission_for(
+            order.liquidity_side(),
+            fill_quantity,
+            fill_px,
+            instrument,
+            underlying_px,
+        )
+    }
+
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(
+            Some(fill.liquidity_side),
+            fill_quantity,
+            fill_px,
+            instrument,
+            fill.underlying_px,
+        )
     }
 }
 
@@ -561,6 +775,23 @@ impl Default for TieredNotionalOptionFeeModel {
     }
 }
 
+impl TieredNotionalOptionFeeModel {
+    fn commission_for(
+        &self,
+        liquidity_side: Option<LiquiditySide>,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        check_option_instrument(instrument, "TieredNotionalOptionFeeModel")?;
+        let rate = option_fee_rate(liquidity_side, instrument, self.maker_rate, self.taker_rate)?;
+        let notional =
+            instrument.try_calculate_notional_value(fill_quantity, fill_px, Some(false))?;
+        let total = mul_checked(notional.as_decimal(), rate)?;
+        Money::from_decimal(total, notional.currency).map_err(Into::into)
+    }
+}
+
 impl FeeModel for TieredNotionalOptionFeeModel {
     fn get_commission(
         &self,
@@ -569,22 +800,33 @@ impl FeeModel for TieredNotionalOptionFeeModel {
         fill_px: Price,
         instrument: &InstrumentAny,
     ) -> anyhow::Result<Money> {
-        check_option_instrument(instrument, "TieredNotionalOptionFeeModel")?;
-        let rate = option_fee_rate(order, instrument, self.maker_rate, self.taker_rate)?;
-        let notional =
-            instrument.try_calculate_notional_value(fill_quantity, fill_px, Some(false))?;
-        let total = mul_checked(notional.as_decimal(), rate)?;
-        Money::from_decimal(total, notional.currency).map_err(Into::into)
+        self.commission_for(order.liquidity_side(), fill_quantity, fill_px, instrument)
+    }
+
+    fn get_fill_commission(
+        &self,
+        _order: &OrderAny,
+        fill: FeeFillContext,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.commission_for(
+            Some(fill.liquidity_side),
+            fill_quantity,
+            fill_px,
+            instrument,
+        )
     }
 }
 
 fn option_fee_rate(
-    order: &OrderAny,
+    liquidity_side: Option<LiquiditySide>,
     instrument: &InstrumentAny,
     maker_rate: Option<Decimal>,
     taker_rate: Option<Decimal>,
 ) -> anyhow::Result<Decimal> {
-    let rate = match order.liquidity_side() {
+    let rate = match liquidity_side {
         Some(LiquiditySide::Maker) => maker_rate.unwrap_or_else(|| instrument.maker_fee()),
         Some(LiquiditySide::Taker) => taker_rate.unwrap_or_else(|| instrument.taker_fee()),
         Some(LiquiditySide::NoLiquiditySide) | None => anyhow::bail!("Liquidity side not set"),
@@ -620,7 +862,10 @@ fn commission_currency(instrument: &InstrumentAny) -> Currency {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderType},
@@ -644,9 +889,9 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::{
-        CappedOptionFeeModel, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel,
+        CappedOptionFeeModel, FeeFillContext, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel,
         MakerTakerFeeModel, PerContractFeeModel, ProbabilityPriceFeeModel,
-        TieredNotionalOptionFeeModel,
+        TieredNotionalOptionFeeModel, write_filled_qty,
     };
 
     #[rstest]
@@ -722,6 +967,257 @@ mod tests {
             .unwrap();
         assert_eq!(commission_first_fill, expected_first_fill);
         assert_eq!(commission_next_fill, expected_next_fill);
+    }
+
+    #[rstest]
+    #[case::first_fill(Quantity::from("0"), Money::from("1 USD"))]
+    #[case::later_fill(Quantity::from("1"), Money::from("0 USD"))]
+    fn test_fixed_model_fill_commission_uses_context(
+        #[case] filled_qty: Quantity,
+        #[case] expected_commission: Money,
+    ) {
+        let aud_usd = InstrumentAny::CurrencyPair(audusd_sim());
+        let fee_model = FixedFeeModel::new(Money::from("1 USD"), Some(true)).unwrap();
+        let order = option_fill_order(&aud_usd, LiquiditySide::Taker);
+        let fill = FeeFillContext {
+            filled_qty,
+            liquidity_side: LiquiditySide::Maker,
+            underlying_px: None,
+        };
+
+        let commission = fee_model
+            .get_fill_commission(
+                &order,
+                fill,
+                Quantity::from("1"),
+                Price::from("1"),
+                &aud_usd,
+            )
+            .unwrap();
+        let mut snapshot = order;
+        write_filled_qty(&mut snapshot, filled_qty);
+        let snapshot_commission = fee_model
+            .get_commission(&snapshot, Quantity::from("1"), Price::from("1"), &aud_usd)
+            .unwrap();
+
+        assert_eq!(commission, expected_commission);
+        assert_eq!(commission, snapshot_commission);
+    }
+
+    #[rstest]
+    #[case::maker(LiquiditySide::Maker)]
+    #[case::taker(LiquiditySide::Taker)]
+    fn test_maker_taker_fill_commission_uses_context(#[case] liquidity_side: LiquiditySide) {
+        let aud_usd = InstrumentAny::CurrencyPair(audusd_sim());
+        let order_liquidity_side = match liquidity_side {
+            LiquiditySide::Maker => LiquiditySide::Taker,
+            LiquiditySide::Taker => LiquiditySide::Maker,
+            LiquiditySide::NoLiquiditySide => unreachable!(),
+        };
+        let order = option_fill_order(&aud_usd, order_liquidity_side);
+        let fee_model = FeeModelAny::MakerTaker(MakerTakerFeeModel);
+        let fill = FeeFillContext {
+            filled_qty: Quantity::from("0"),
+            liquidity_side,
+            underlying_px: None,
+        };
+        let commission = fee_model
+            .get_fill_commission(
+                &order,
+                fill,
+                Quantity::from("1"),
+                Price::from("1"),
+                &aud_usd,
+            )
+            .unwrap();
+        let mut snapshot = order;
+        snapshot.set_liquidity_side(liquidity_side);
+        let snapshot_commission = fee_model
+            .get_commission_with_context(
+                &snapshot,
+                Quantity::from("1"),
+                Price::from("1"),
+                &aud_usd,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(commission, snapshot_commission);
+    }
+
+    #[rstest]
+    #[case::maker(LiquiditySide::Maker)]
+    #[case::taker(LiquiditySide::Taker)]
+    fn test_probability_price_fill_commission_uses_context(#[case] liquidity_side: LiquiditySide) {
+        let binary_option = InstrumentAny::BinaryOption(binary_option());
+        let order_liquidity_side = match liquidity_side {
+            LiquiditySide::Maker => LiquiditySide::Taker,
+            LiquiditySide::Taker => LiquiditySide::Maker,
+            LiquiditySide::NoLiquiditySide => unreachable!(),
+        };
+        let order = binary_option_fill_order(&binary_option, order_liquidity_side, "0.5");
+        let fee_model = ProbabilityPriceFeeModel;
+        let fill = FeeFillContext {
+            filled_qty: Quantity::from("0"),
+            liquidity_side,
+            underlying_px: None,
+        };
+        let commission = fee_model
+            .get_fill_commission(
+                &order,
+                fill,
+                Quantity::from("1"),
+                Price::from("0.5"),
+                &binary_option,
+            )
+            .unwrap();
+        let mut snapshot = order;
+        snapshot.set_liquidity_side(liquidity_side);
+        let snapshot_commission = fee_model
+            .get_commission_with_context(
+                &snapshot,
+                Quantity::from("1"),
+                Price::from("0.5"),
+                &binary_option,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(commission, snapshot_commission);
+    }
+
+    #[rstest]
+    #[case::maker(LiquiditySide::Maker)]
+    #[case::taker(LiquiditySide::Taker)]
+    fn test_capped_option_fill_commission_uses_context(
+        crypto_option_btc_deribit: CryptoOption,
+        #[case] liquidity_side: LiquiditySide,
+    ) {
+        let instrument = InstrumentAny::CryptoOption(crypto_option_btc_deribit);
+        let order_liquidity_side = match liquidity_side {
+            LiquiditySide::Maker => LiquiditySide::Taker,
+            LiquiditySide::Taker => LiquiditySide::Maker,
+            LiquiditySide::NoLiquiditySide => unreachable!(),
+        };
+        let order = option_fill_order(&instrument, order_liquidity_side);
+        let fee_model = CappedOptionFeeModel::default();
+        let fill = FeeFillContext {
+            filled_qty: Quantity::from("0"),
+            liquidity_side,
+            underlying_px: Some(Price::from("50000")),
+        };
+        let commission = fee_model
+            .get_fill_commission(
+                &order,
+                fill,
+                Quantity::from("1"),
+                Price::from("100"),
+                &instrument,
+            )
+            .unwrap();
+        let mut snapshot = order;
+        snapshot.set_liquidity_side(liquidity_side);
+        let snapshot_commission = fee_model
+            .get_commission_with_context(
+                &snapshot,
+                Quantity::from("1"),
+                Price::from("100"),
+                &instrument,
+                fill.underlying_px,
+            )
+            .unwrap();
+
+        assert_eq!(commission, snapshot_commission);
+    }
+
+    #[rstest]
+    #[case::maker(LiquiditySide::Maker)]
+    #[case::taker(LiquiditySide::Taker)]
+    fn test_tiered_option_fill_commission_uses_context(
+        crypto_option_btc_deribit: CryptoOption,
+        #[case] liquidity_side: LiquiditySide,
+    ) {
+        let instrument = InstrumentAny::CryptoOption(crypto_option_btc_deribit);
+        let order_liquidity_side = match liquidity_side {
+            LiquiditySide::Maker => LiquiditySide::Taker,
+            LiquiditySide::Taker => LiquiditySide::Maker,
+            LiquiditySide::NoLiquiditySide => unreachable!(),
+        };
+        let order = option_fill_order(&instrument, order_liquidity_side);
+        let fee_model = TieredNotionalOptionFeeModel::default();
+        let fill = FeeFillContext {
+            filled_qty: Quantity::from("0"),
+            liquidity_side,
+            underlying_px: None,
+        };
+        let commission = fee_model
+            .get_fill_commission(
+                &order,
+                fill,
+                Quantity::from("1"),
+                Price::from("100"),
+                &instrument,
+            )
+            .unwrap();
+        let mut snapshot = order;
+        snapshot.set_liquidity_side(liquidity_side);
+        let snapshot_commission = fee_model
+            .get_commission(
+                &snapshot,
+                Quantity::from("1"),
+                Price::from("100"),
+                &instrument,
+            )
+            .unwrap();
+
+        assert_eq!(commission, snapshot_commission);
+    }
+
+    #[rstest]
+    fn test_default_fill_commission_materializes_context() {
+        let observed = Rc::new(RefCell::new((Quantity::from("0"), None)));
+        let model = ContextRecordingFeeModel {
+            observed: Rc::clone(&observed),
+        };
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let order = option_fill_order(&instrument, LiquiditySide::Taker);
+        let fill = FeeFillContext {
+            filled_qty: Quantity::from("3"),
+            liquidity_side: LiquiditySide::Maker,
+            underlying_px: None,
+        };
+
+        model
+            .get_fill_commission(
+                &order,
+                fill,
+                Quantity::from("1"),
+                Price::from("1"),
+                &instrument,
+            )
+            .unwrap();
+
+        assert_eq!(
+            *observed.borrow(),
+            (fill.filled_qty, Some(fill.liquidity_side))
+        );
+    }
+
+    struct ContextRecordingFeeModel {
+        observed: Rc<RefCell<(Quantity, Option<LiquiditySide>)>>,
+    }
+
+    impl FeeModel for ContextRecordingFeeModel {
+        fn get_commission(
+            &self,
+            order: &OrderAny,
+            _fill_quantity: Quantity,
+            _fill_px: Price,
+            _instrument: &InstrumentAny,
+        ) -> anyhow::Result<Money> {
+            *self.observed.borrow_mut() = (order.filled_qty(), order.liquidity_side());
+            Ok(Money::zero(Currency::USD()))
+        }
     }
 
     #[rstest]
